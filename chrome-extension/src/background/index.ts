@@ -5,6 +5,9 @@ import {
   firewallStore,
   generalSettingsStore,
   llmProviderStore,
+  amplifyConfigStore,
+  chatHistoryStore,
+  Actors,
 } from '@extension/storage';
 import BrowserContext from './browser/context';
 import { Executor } from './agent/executor';
@@ -15,12 +18,18 @@ import type { BaseChatModel } from '@langchain/core/language_models/chat_models'
 import { DEFAULT_AGENT_OPTIONS } from './agent/types';
 import { SpeechToTextService } from './services/speechToText';
 import { ProviderTypeEnum } from '@extension/storage';
+import { AmplifyEventsService } from './services/amplifyEventsService';
+import { instanceIdService } from './services/instanceId';
+import { executorConnection } from './services/appSyncEvents/connection';
 
 const logger = createLogger('background');
 
 const browserContext = new BrowserContext({});
 let currentExecutor: Executor | null = null;
 let currentPort: chrome.runtime.Port | null = null;
+let amplifyEventsService: AmplifyEventsService | null = null;
+// Map to track which chat sessions correspond to which task IDs
+const taskToChatSessionMap = new Map<string, string>();
 
 // Setup side panel behavior
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(error => console.error(error));
@@ -82,6 +91,53 @@ chrome.tabs.onRemoved.addListener(tabId => {
   browserContext.removeAttachedPage(tabId);
 });
 
+// Initialize AmplifyEventsService
+let isInitializing = false;
+async function initializeAmplifyEvents() {
+  if (isInitializing || amplifyEventsService) {
+    logger.info('AmplifyEventsService already initialized or initializing');
+    return;
+  }
+
+  isInitializing = true;
+  try {
+    logger.info('Initializing AmplifyEventsService...');
+
+    // Initialize instance ID service first
+    await instanceIdService.initialize();
+
+    // Initialize executor connection
+    executorConnection.initialize(browserContext, setupExecutor, subscribeToExecutorEvents, registerTaskChatSession);
+
+    const config = await amplifyConfigStore.getConfig();
+    if (config.enabled) {
+      amplifyEventsService = new AmplifyEventsService();
+      await amplifyEventsService.initialize();
+      logger.info('AmplifyEventsService initialized successfully');
+    } else {
+      logger.info('AmplifyEventsService is disabled');
+    }
+  } catch (error) {
+    logger.error('Failed to initialize AmplifyEventsService:', error);
+  } finally {
+    isInitializing = false;
+  }
+}
+
+// Initialize on startup
+chrome.runtime.onStartup.addListener(async () => {
+  await initializeAmplifyEvents();
+});
+
+chrome.runtime.onInstalled.addListener(async () => {
+  await initializeAmplifyEvents();
+});
+
+// Initialize immediately when script loads
+initializeAmplifyEvents().catch(error => {
+  logger.error('Failed to initialize AmplifyEventsService on startup:', error);
+});
+
 logger.info('background loaded');
 
 // Listen for simple messages (e.g., from options page)
@@ -95,6 +151,7 @@ chrome.runtime.onMessage.addListener(() => {
 chrome.runtime.onConnect.addListener(port => {
   if (port.name === 'side-panel-connection') {
     currentPort = port;
+    executorConnection.setCurrentPort(port);
 
     port.onMessage.addListener(async message => {
       try {
@@ -110,6 +167,7 @@ chrome.runtime.onConnect.addListener(port => {
 
             logger.info('new_task', message.tabId, message.task);
             currentExecutor = await setupExecutor(message.taskId, message.task, browserContext);
+            executorConnection.setCurrentExecutor(currentExecutor);
             subscribeToExecutorEvents(currentExecutor);
 
             const result = await currentExecutor.execute();
@@ -125,6 +183,7 @@ chrome.runtime.onConnect.addListener(port => {
             // If executor exists, add follow-up task
             if (currentExecutor) {
               currentExecutor.addFollowUpTask(message.task);
+              executorConnection.setCurrentExecutor(currentExecutor);
               // Re-subscribe to events in case the previous subscription was cleaned up
               subscribeToExecutorEvents(currentExecutor);
               const result = await currentExecutor.execute();
@@ -241,6 +300,7 @@ chrome.runtime.onConnect.addListener(port => {
       // this event is also triggered when the side panel is closed, so we need to cancel the task
       console.log('Side panel disconnected');
       currentPort = null;
+      executorConnection.setCurrentPort(null);
       currentExecutor?.cancel();
     });
   }
@@ -320,7 +380,13 @@ async function setupExecutor(taskId: string, task: string, browserContext: Brows
   return executor;
 }
 
-// Update subscribeToExecutorEvents to use port
+// Function to register task to chat session mapping
+function registerTaskChatSession(taskId: string, chatSessionId: string): void {
+  taskToChatSessionMap.set(taskId, chatSessionId);
+  logger.info('Registered task to chat session mapping:', { taskId, chatSessionId });
+}
+
+// Update subscribeToExecutorEvents to use port and handle AppSync responses
 async function subscribeToExecutorEvents(executor: Executor) {
   // Clear previous event listeners to prevent multiple subscriptions
   executor.clearExecutionEvents();
@@ -335,11 +401,87 @@ async function subscribeToExecutorEvents(executor: Executor) {
       logger.error('Failed to send message to side panel:', error);
     }
 
-    if (
-      event.state === ExecutionState.TASK_OK ||
-      event.state === ExecutionState.TASK_FAIL ||
-      event.state === ExecutionState.TASK_CANCEL
-    ) {
+    // Save message to chat history
+    const chatSessionId = taskToChatSessionMap.get(event.data.taskId);
+    if (chatSessionId) {
+      const isSystemEvent = event.actor === Actors.SYSTEM;
+      const isProgressUpdate =
+        event.actor === Actors.NAVIGATOR &&
+        event.state === ExecutionState.STEP_OK &&
+        event.data.details === 'Showing progress...';
+
+      // Don't save initial system start message or progress updates
+      const shouldSave = !(
+        (isSystemEvent && event.state === ExecutionState.TASK_START) ||
+        isProgressUpdate ||
+        (event.actor === Actors.PLANNER && event.state === ExecutionState.STEP_START)
+      );
+
+      if (shouldSave) {
+        try {
+          let messageContent: string | unknown = event.data.details;
+
+          // For the final success event, extract the answer string
+          if (
+            event.actor === Actors.SYSTEM &&
+            event.state === ExecutionState.TASK_OK &&
+            typeof messageContent === 'object' &&
+            messageContent &&
+            'answer' in messageContent
+          ) {
+            messageContent = (messageContent as { answer: string }).answer;
+          }
+
+          // Ensure content is always a string before saving
+          if (typeof messageContent !== 'string') {
+            messageContent = JSON.stringify(messageContent);
+          }
+
+          await chatHistoryStore.addMessage(chatSessionId, {
+            actor: event.actor,
+            content: messageContent as string,
+            timestamp: event.timestamp,
+          });
+        } catch (e) {
+          logger.error('Failed to store message in chat history:', e);
+        }
+      }
+    }
+
+    // Handle AppSync completion reporting
+    if (amplifyEventsService) {
+      if (
+        event.state === ExecutionState.TASK_OK ||
+        event.state === ExecutionState.TASK_FAIL ||
+        event.state === ExecutionState.TASK_CANCEL
+      ) {
+        // Send completion status to AppSync if service is available
+        const success = event.state === ExecutionState.TASK_OK;
+        const finalAnswer =
+          typeof event.data?.details === 'object' && event.data?.details && 'answer' in event.data.details
+            ? (event.data.details as { answer: string }).answer
+            : event.data.details;
+
+        const error = success
+          ? undefined
+          : typeof event.data?.details === 'object' && event.data?.details && 'error' in event.data.details
+            ? (event.data.details as { error: string }).error
+            : typeof event.data?.details === 'string'
+              ? event.data.details
+              : 'Task failed without a specific error message.';
+
+        logger.info('Sending task completion to AppSync:', {
+          taskId: event.data.taskId,
+          success,
+          details: finalAnswer,
+          error,
+        });
+        await amplifyEventsService.handleTaskCompletion(event.data.taskId, success, finalAnswer, error);
+      }
+
+      // Clean up mapping when task completes
+      taskToChatSessionMap.delete(event.data.taskId);
+
       await currentExecutor?.cleanup();
     }
   });
