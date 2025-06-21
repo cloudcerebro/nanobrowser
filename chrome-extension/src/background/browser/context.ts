@@ -9,15 +9,19 @@ import {
 import Page, { build_initial_state } from './page';
 import { createLogger } from '@src/background/log';
 import { isUrlAllowed } from './util';
+import DebuggerManager from './debuggerManager';
 
 const logger = createLogger('BrowserContext');
 export default class BrowserContext {
   private _config: BrowserContextConfig;
   private _currentTabId: number | null = null;
   private _attachedPages: Map<number, Page> = new Map();
+  private _debuggerManager: DebuggerManager;
+  private _pageCreationLocks: Map<number, Promise<Page>> = new Map();
 
   constructor(config: Partial<BrowserContextConfig>) {
     this._config = { ...DEFAULT_BROWSER_CONTEXT_CONFIG, ...config };
+    this._debuggerManager = DebuggerManager.getInstance();
   }
 
   public getConfig(): BrowserContextConfig {
@@ -33,41 +37,123 @@ export default class BrowserContext {
     this._currentTabId = tabId;
   }
 
-  private async _getOrCreatePage(tab: chrome.tabs.Tab, forceUpdate = false): Promise<Page> {
+  private async _getOrCreatePage(tab: chrome.tabs.Tab): Promise<Page> {
     if (!tab.id) {
       throw new Error('Tab ID is not available');
     }
 
-    const existingPage = this._attachedPages.get(tab.id);
-    if (existingPage) {
-      logger.info('getOrCreatePage', tab.id, 'already attached');
-      if (!forceUpdate) {
-        return existingPage;
-      }
-      // detach the page and remove it from the attached pages if forceUpdate is true
-      await existingPage.detachPuppeteer();
-      this._attachedPages.delete(tab.id);
+    // Check if another call is already creating a page for this tab
+    const existingLock = this._pageCreationLocks.get(tab.id);
+    if (existingLock) {
+      logger.info('getOrCreatePage', tab.id, 'waiting for existing page creation to complete');
+      return await existingLock;
     }
-    logger.info('getOrCreatePage', tab.id, 'creating new page');
-    return new Page(tab.id, tab.url || '', tab.title || '', this._config);
+
+    let page = this._attachedPages.get(tab.id);
+    if (page) {
+      // Check if debugger manager thinks this tab is busy
+      if (this._debuggerManager.isTabBusy(tab.id)) {
+        logger.info('getOrCreatePage', tab.id, 'tab is busy with debugger operation, waiting...');
+        // Wait for the operation to complete before proceeding
+        let attempts = 0;
+        while (this._debuggerManager.isTabBusy(tab.id) && attempts < 20) {
+          await new Promise(resolve => setTimeout(resolve, 250));
+          attempts++;
+        }
+      }
+
+      // Re-check the page after potential wait
+      page = this._attachedPages.get(tab.id);
+      if (page && page.attached) {
+        logger.info('getOrCreatePage', tab.id, 'found existing connected page');
+        return page;
+      } else if (page) {
+        // Page exists but not attached - remove it and create new one
+        logger.info('getOrCreatePage', tab.id, 'existing page not connected, removing');
+        await this.detachPage(tab.id);
+      }
+    }
+
+    // Create a lock promise for this tab to prevent concurrent page creation
+    const pageCreationPromise = this._createPageWithLock(tab);
+    this._pageCreationLocks.set(tab.id, pageCreationPromise);
+
+    try {
+      return await pageCreationPromise;
+    } finally {
+      // Remove the lock when done
+      this._pageCreationLocks.delete(tab.id);
+    }
+  }
+
+  private async _createPageWithLock(tab: chrome.tabs.Tab): Promise<Page> {
+    if (!tab.id) {
+      throw new Error('Tab ID is not available');
+    }
+
+    // Check if tab is busy before creating new page
+    if (this._debuggerManager.isTabBusy(tab.id)) {
+      logger.info('getOrCreatePage', tab.id, 'tab still busy, forcing wait...');
+      let attempts = 0;
+      while (this._debuggerManager.isTabBusy(tab.id) && attempts < 20) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+        attempts++;
+      }
+    }
+
+    logger.info('getOrCreatePage', tab.id, 'creating new page instance');
+    const page = new Page(tab.id, tab.url || '', tab.title || '', this._config);
+    // Do not add to map here. Add it only after successful attachment.
+    return page;
   }
 
   public async cleanup(): Promise<void> {
-    const currentPage = await this.getCurrentPage();
-    currentPage?.removeHighlight();
-    // detach all pages
-    for (const page of this._attachedPages.values()) {
-      await page.detachPuppeteer();
+    try {
+      const currentPage = this._currentTabId ? this._attachedPages.get(this._currentTabId) : null;
+      if (currentPage) {
+        await currentPage.removeHighlight();
+      }
+    } catch (error) {
+      logger.error('Error removing highlight during cleanup:', error);
     }
+
+    // Clear debugger state for all attached tabs
+    for (const tabId of this._attachedPages.keys()) {
+      this._debuggerManager.clearTabState(tabId);
+    }
+
+    // detach all pages with proper error handling
+    const detachPromises = Array.from(this._attachedPages.values()).map(async page => {
+      try {
+        await page.detachPuppeteer();
+      } catch (error) {
+        logger.error(`Error detaching page ${page.tabId}:`, error);
+        // If page detachment fails, try force detach through debugger manager
+        try {
+          await this._debuggerManager.detachDebugger(page.tabId);
+        } catch (debuggerError) {
+          logger.error(`Error force detaching debugger for tab ${page.tabId}:`, debuggerError);
+        }
+      }
+    });
+
+    await Promise.allSettled(detachPromises);
     this._attachedPages.clear();
+    this._pageCreationLocks.clear();
     this._currentTabId = null;
   }
 
   public async attachPage(page: Page): Promise<boolean> {
     // check if page is already attached
     if (this._attachedPages.has(page.tabId)) {
-      logger.info('attachPage', page.tabId, 'already attached');
-      return true;
+      const existingPage = this._attachedPages.get(page.tabId);
+      if (existingPage && existingPage.attached) {
+        logger.info('attachPage', page.tabId, 'already attached and connected');
+        return true;
+      }
+      // If page exists but not attached, remove it and try again
+      logger.info('attachPage', page.tabId, 'existing page not connected, replacing');
+      await this.detachPage(page.tabId);
     }
 
     if (await page.attachPuppeteer()) {
@@ -89,8 +175,21 @@ export default class BrowserContext {
     }
   }
 
-  public async getCurrentPage(): Promise<Page> {
-    // 1. If _currentTabId not set, query the active tab and attach it
+  public async getCurrentPage(forceNewTab = false): Promise<Page> {
+    // 1. If forceNewTab is true, always create a new tab
+    if (forceNewTab) {
+      const newTab = await chrome.tabs.create({ url: this._config.homePageUrl, active: true });
+      if (!newTab.id) {
+        throw new Error('No tab ID available');
+      }
+      logger.info('force new tab', newTab.id);
+      const page = await this._getOrCreatePage(newTab);
+      await this.attachPage(page);
+      this._currentTabId = newTab.id;
+      return page;
+    }
+
+    // 2. If _currentTabId not set, query the active tab and attach it
     if (!this._currentTabId) {
       let activeTab: chrome.tabs.Tab;
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -112,18 +211,17 @@ export default class BrowserContext {
       return page;
     }
 
-    // 2. If _currentTabId is set but not in attachedPages, attach the tab
-    const existingPage = this._attachedPages.get(this._currentTabId);
-    if (!existingPage) {
+    // 3. If _currentTabId is set but not in attachedPages, attach the tab
+    let page = this._attachedPages.get(this._currentTabId);
+    if (!page) {
       const tab = await chrome.tabs.get(this._currentTabId);
-      const page = await this._getOrCreatePage(tab);
+      page = await this._getOrCreatePage(tab);
       // set current tab id to null if the page is not attached successfully
       await this.attachPage(page);
-      return page;
     }
 
-    // 3. Return existing page from attachedPages
-    return existingPage;
+    // 4. Return existing page from attachedPages
+    return page;
   }
 
   /**
@@ -251,7 +349,7 @@ export default class BrowserContext {
     await this.waitForTabEvents(tabId);
 
     // Reattach the page after navigation completes
-    const updatedPage = await this._getOrCreatePage(await chrome.tabs.get(tabId), true);
+    const updatedPage = await this._getOrCreatePage(await chrome.tabs.get(tabId));
     await this.attachPage(updatedPage);
     this._currentTabId = tabId;
   }

@@ -79,6 +79,16 @@ class ExecutorConnectionImpl implements ExecutorConnection {
       throw new Error('ExecutorConnection not initialized');
     }
 
+    // Cancel any existing executor before starting new task
+    if (this.currentExecutor) {
+      try {
+        await this.currentExecutor.cancel();
+        await this.currentExecutor.cleanup();
+      } catch (error) {
+        console.error('Error cleaning up previous executor:', error);
+      }
+    }
+
     const executor = await this.setupExecutorFn(taskId, task, browserContext);
     this.setCurrentExecutor(executor);
     return executor;

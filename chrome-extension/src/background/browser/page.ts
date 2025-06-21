@@ -21,6 +21,7 @@ import { type BrowserContextConfig, DEFAULT_BROWSER_CONTEXT_CONFIG, type PageSta
 import { createLogger } from '@src/background/log';
 import { ClickableElementProcessor } from './dom/clickable/service';
 import { isUrlAllowed } from './util';
+import DebuggerManager from './debuggerManager';
 
 const logger = createLogger('Page');
 
@@ -66,11 +67,16 @@ export default class Page {
   private _validWebPage = false;
   private _cachedState: PageState | null = null;
   private _cachedStateClickableElementsHashes: CachedStateClickableElementsHashes | null = null;
+  private _debuggerManager: DebuggerManager;
+  private _reconnectionAttempts = 0;
+  private _maxReconnectionAttempts = 3;
+  private _isReconnecting = false;
 
   constructor(tabId: number, url: string, title: string, config: Partial<BrowserContextConfig> = {}) {
     this._tabId = tabId;
     this._config = { ...DEFAULT_BROWSER_CONTEXT_CONFIG, ...config };
     this._state = build_initial_state(tabId, url, title);
+    this._debuggerManager = DebuggerManager.getInstance();
     // chrome://newtab/, chrome://newtab/extensions, https://chromewebstore.google.com/ are not valid web pages, can't be attached
     const lowerCaseUrl = url.trim().toLowerCase();
     this._validWebPage =
@@ -93,30 +99,149 @@ export default class Page {
     return this._validWebPage && this._puppeteerPage !== null;
   }
 
+  private async _isConnectionHealthy(): Promise<boolean> {
+    if (!this._puppeteerPage || !this._browser) {
+      return false;
+    }
+
+    try {
+      // Quick health check - try to evaluate a simple expression
+      await this._puppeteerPage.evaluate(() => true);
+      return true;
+    } catch (error) {
+      logger.warning(`Connection health check failed for tab ${this._tabId}:`, error);
+      return false;
+    }
+  }
+
+  private async _attemptReconnection(): Promise<boolean> {
+    if (this._isReconnecting) {
+      logger.info(`Tab ${this._tabId} already attempting reconnection, waiting...`);
+      // Wait for ongoing reconnection to complete
+      let attempts = 0;
+      while (this._isReconnecting && attempts < 30) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        attempts++;
+      }
+      return this.attached;
+    }
+
+    if (this._reconnectionAttempts >= this._maxReconnectionAttempts) {
+      logger.error(`Tab ${this._tabId} exceeded maximum reconnection attempts (${this._maxReconnectionAttempts})`);
+      return false;
+    }
+
+    this._isReconnecting = true;
+    this._reconnectionAttempts++;
+
+    try {
+      logger.info(
+        `Tab ${this._tabId} attempting reconnection (attempt ${this._reconnectionAttempts}/${this._maxReconnectionAttempts})`,
+      );
+
+      // First clean up the broken connection
+      try {
+        if (this._browser) {
+          await this._browser.disconnect();
+        }
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+      this._browser = null;
+      this._puppeteerPage = null;
+
+      // Wait a bit before reconnecting
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Use the debugger manager to re-establish connection
+      const prepared = await this._debuggerManager.attachPuppeteerDebugger(this._tabId);
+      if (!prepared) {
+        logger.error(`Failed to prepare debugger for reconnection to tab ${this._tabId}`);
+        return false;
+      }
+
+      // Reconnect Puppeteer
+      const browser = await connect({
+        transport: await ExtensionTransport.connectTab(this._tabId),
+        defaultViewport: null,
+        protocol: 'cdp' as ProtocolType,
+      });
+      this._browser = browser;
+
+      const [page] = await browser.pages();
+      this._puppeteerPage = page;
+
+      // Add anti-detection scripts
+      await this._addAntiDetectionScripts();
+
+      logger.info(`Tab ${this._tabId} successfully reconnected`);
+      this._reconnectionAttempts = 0; // Reset counter on success
+      return true;
+    } catch (error) {
+      logger.error(`Tab ${this._tabId} reconnection attempt ${this._reconnectionAttempts} failed:`, error);
+      return false;
+    } finally {
+      this._isReconnecting = false;
+    }
+  }
+
+  private async _ensureConnection(): Promise<boolean> {
+    // Check if we have a valid connection
+    if (await this._isConnectionHealthy()) {
+      return true;
+    }
+
+    logger.warning(`Tab ${this._tabId} connection lost, attempting to reconnect...`);
+    return await this._attemptReconnection();
+  }
+
   async attachPuppeteer(): Promise<boolean> {
+    // If we are already attached, do nothing.
+    if (this.attached) {
+      return true;
+    }
     if (!this._validWebPage) {
       return false;
     }
 
-    if (this._puppeteerPage) {
-      return true;
+    // Wait if tab is busy with another debugger operation
+    let attempts = 0;
+    while (this._debuggerManager.isTabBusy(this._tabId) && attempts < 10) {
+      logger.info(`Tab ${this._tabId} is busy, waiting...`);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      attempts++;
+    }
+
+    // Use the debugger manager to prepare for Puppeteer attachment
+    const prepared = await this._debuggerManager.attachPuppeteerDebugger(this._tabId);
+    if (!prepared) {
+      logger.error(`Failed to prepare debugger for tab ${this._tabId}`);
+      return false;
     }
 
     logger.info('attaching puppeteer', this._tabId);
-    const browser = await connect({
-      transport: await ExtensionTransport.connectTab(this._tabId),
-      defaultViewport: null,
-      protocol: 'cdp' as ProtocolType,
-    });
-    this._browser = browser;
+    try {
+      // Now let Puppeteer handle the connection (which includes debugger attachment)
+      const browser = await connect({
+        transport: await ExtensionTransport.connectTab(this._tabId),
+        defaultViewport: null,
+        protocol: 'cdp' as ProtocolType,
+      });
+      this._browser = browser;
 
-    const [page] = await browser.pages();
-    this._puppeteerPage = page;
+      const [page] = await browser.pages();
+      this._puppeteerPage = page;
 
-    // Add anti-detection scripts
-    await this._addAntiDetectionScripts();
+      // Add anti-detection scripts
+      await this._addAntiDetectionScripts();
 
-    return true;
+      return true;
+    } catch (error) {
+      logger.error('Error connecting puppeteer:', error);
+      // If puppeteer connection fails, clean up the debugger state
+      await this._debuggerManager.detachPuppeteerDebugger(this._tabId);
+      return false;
+    }
   }
 
   private async _addAntiDetectionScripts(): Promise<void> {
@@ -162,13 +287,24 @@ export default class Page {
   }
 
   async detachPuppeteer(): Promise<void> {
-    if (this._browser) {
-      await this._browser.disconnect();
+    try {
+      if (this._browser) {
+        await this._browser.disconnect();
+      }
+    } catch (error) {
+      logger.error('Error disconnecting browser:', error);
+    } finally {
       this._browser = null;
       this._puppeteerPage = null;
       // reset the state
       this._state = build_initial_state(this._tabId);
+      // Reset reconnection state
+      this._reconnectionAttempts = 0;
+      this._isReconnecting = false;
     }
+
+    // Use the debugger manager to handle detachment
+    await this._debuggerManager.detachPuppeteerDebugger(this._tabId);
   }
 
   async removeHighlight(): Promise<void> {
@@ -305,13 +441,14 @@ export default class Page {
   }
 
   async takeScreenshot(fullPage = false): Promise<string | null> {
-    if (!this._puppeteerPage) {
-      throw new Error('Puppeteer page is not connected');
+    // Ensure connection is healthy before proceeding
+    if (!(await this._ensureConnection())) {
+      throw new Error('Puppeteer connection could not be established');
     }
 
     try {
       // First disable animations/transitions
-      await this._puppeteerPage.evaluate(() => {
+      await this._puppeteerPage!.evaluate(() => {
         const styleId = 'puppeteer-disable-animations';
         if (!document.getElementById(styleId)) {
           const style = document.createElement('style');
@@ -327,7 +464,7 @@ export default class Page {
       });
 
       // Take the screenshot using JPEG format with 80% quality
-      const screenshot = await this._puppeteerPage.screenshot({
+      const screenshot = await this._puppeteerPage!.screenshot({
         fullPage: fullPage,
         encoding: 'base64',
         type: 'jpeg',
@@ -335,7 +472,7 @@ export default class Page {
       });
 
       // Clean up the style element
-      await this._puppeteerPage.evaluate(() => {
+      await this._puppeteerPage!.evaluate(() => {
         const style = document.getElementById('puppeteer-disable-animations');
         if (style) {
           style.remove();
@@ -476,8 +613,9 @@ export default class Page {
   }
 
   async sendKeys(keys: string): Promise<void> {
-    if (!this._puppeteerPage) {
-      throw new Error('Puppeteer page is not connected');
+    // Ensure connection is healthy before proceeding
+    if (!(await this._ensureConnection())) {
+      throw new Error('Puppeteer connection could not be established');
     }
 
     // Split combination keys (e.g., "Control+A" or "Shift+ArrowLeft")
@@ -489,12 +627,12 @@ export default class Page {
     try {
       // Press all modifier keys (e.g., Control, Shift, etc.)
       for (const modifier of modifiers) {
-        await this._puppeteerPage.keyboard.down(this._convertKey(modifier));
+        await this._puppeteerPage!.keyboard.down(this._convertKey(modifier));
       }
       // Press the main key
       // also wait for stable state
       await Promise.all([
-        this._puppeteerPage.keyboard.press(this._convertKey(mainKey)),
+        this._puppeteerPage!.keyboard.press(this._convertKey(mainKey)),
         this.waitForPageAndFramesLoad(),
       ]);
       logger.info('sendKeys complete', keys);
@@ -505,7 +643,7 @@ export default class Page {
       // Release all modifier keys in reverse order regardless of any errors in key press.
       for (const modifier of [...modifiers].reverse()) {
         try {
-          await this._puppeteerPage.keyboard.up(this._convertKey(modifier));
+          await this._puppeteerPage!.keyboard.up(this._convertKey(modifier));
         } catch (releaseError) {
           logger.error('Failed to release modifier:', modifier, releaseError);
         }
@@ -821,8 +959,9 @@ export default class Page {
   }
 
   async inputTextElementNode(useVision: boolean, elementNode: DOMElementNode, text: string): Promise<void> {
-    if (!this._puppeteerPage) {
-      throw new Error('Puppeteer is not connected');
+    // Ensure connection is healthy before proceeding
+    if (!(await this._ensureConnection())) {
+      throw new Error('Puppeteer connection could not be established');
     }
 
     try {
@@ -1004,8 +1143,9 @@ export default class Page {
   }
 
   async clickElementNode(useVision: boolean, elementNode: DOMElementNode): Promise<void> {
-    if (!this._puppeteerPage) {
-      throw new Error('Puppeteer is not connected');
+    // Ensure connection is healthy before proceeding
+    if (!(await this._ensureConnection())) {
+      throw new Error('Puppeteer connection could not be established');
     }
 
     try {

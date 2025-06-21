@@ -12,6 +12,7 @@ import {
 import BrowserContext from './browser/context';
 import { Executor } from './agent/executor';
 import { createLogger } from './log';
+import DebuggerManager from './browser/debuggerManager';
 import { ExecutionState } from './agent/event/types';
 import { createChatModel } from './agent/helper';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
@@ -166,6 +167,17 @@ chrome.runtime.onConnect.addListener(port => {
             if (!message.tabId) return port.postMessage({ type: 'error', error: 'No tab ID provided' });
 
             logger.info('new_task', message.tabId, message.task);
+
+            // Cancel any existing executor before starting new task
+            if (currentExecutor) {
+              try {
+                await currentExecutor.cancel();
+                await currentExecutor.cleanup();
+              } catch (error) {
+                logger.error('Error cleaning up previous executor:', error);
+              }
+            }
+
             currentExecutor = await setupExecutor(message.taskId, message.task, browserContext);
             executorConnection.setCurrentExecutor(currentExecutor);
             subscribeToExecutorEvents(currentExecutor);
@@ -307,6 +319,11 @@ chrome.runtime.onConnect.addListener(port => {
 });
 
 async function setupExecutor(taskId: string, task: string, browserContext: BrowserContext) {
+  // Always force cleanup and fresh tab for new tasks to prevent debugger conflicts
+  const debuggerManager = DebuggerManager.getInstance();
+  await debuggerManager.forceDetachAll();
+  await browserContext.cleanup();
+
   const providers = await llmProviderStore.getAllProviders();
   // if no providers, need to display the options page
   if (Object.keys(providers).length === 0) {
